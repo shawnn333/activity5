@@ -1,0 +1,208 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Ensure Android platform files exist
+        run: |
+          if [ ! -d "android" ]; then
+            flutter create --platforms=android .
+          fi
+
+      - name: Add required permissions to the app manifest
+        run: |
+          # The generated android/ project from `flutter create` only has
+          # permissions in its debug manifest, so the RELEASE build needs
+          # these declared here:
+          #  - INTERNET: Activity 5 downloads the map tiles
+          #  - Bluetooth / Wi-Fi / Location: Activity 4 (Nearby Connections)
+          #    and Activity 5 (geofencing GPS)
+          # Inserted right after the opening <manifest ...> tag.
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          PERMS='    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />\n    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />'
+          if ! grep -q "BLUETOOTH_ADVERTISE" "$MANIFEST"; then
+            sed -i "0,/<manifest [^>]*>/s||&\n${PERMS}|" "$MANIFEST"
+            echo "Permissions added:"
+            grep "uses-permission" "$MANIFEST"
+          fi
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Patch abandoned plugins for Gradle 9 / AGP 8+ compatibility
+        run: |
+          # Fix 1: jcenter() was removed in Gradle 9. Old plugins that
+          # still call it crash before their build.gradle can even be
+          # evaluated. jcenter has redirected to mavenCentral since 2021.
+          for f in $(find "$HOME/.pub-cache/hosted/pub.dev" -maxdepth 3 -name "build.gradle" 2>/dev/null); do
+            if grep -q "jcenter()" "$f"; then
+              echo "Removing jcenter() in $f"
+              sed -i 's/jcenter()/mavenCentral()/g' "$f"
+            fi
+          done
+
+          # Fix 2: AGP 8+ requires every Android module to declare a
+          # `namespace` in build.gradle instead of relying on the
+          # <manifest package="..."> attribute. Old plugins predate this
+          # requirement. Pull the package name out of each plugin's own
+          # manifest and inject it as the namespace if one isn't already
+          # declared.
+          for manifest in $(find "$HOME/.pub-cache/hosted/pub.dev" -maxdepth 5 -path "*/android/src/main/AndroidManifest.xml" 2>/dev/null); do
+            build_gradle="$(dirname "$(dirname "$(dirname "$manifest")")")/build.gradle"
+            if [ -f "$build_gradle" ] && ! grep -q "namespace" "$build_gradle"; then
+              pkg=$(grep -o 'package="[^"]*"' "$manifest" | head -n1 | sed 's/package="//;s/"//')
+              if [ -n "$pkg" ]; then
+                echo "Adding namespace \"$pkg\" to $build_gradle"
+                sed -i "0,/android {/s//android {\n    namespace \"$pkg\"/" "$build_gradle"
+              fi
+            fi
+          done
+
+          # Fix 3: old plugins hardcode a low compileSdkVersion (e.g. 33).
+          # Modern AndroidX libraries they transitively depend on (window,
+          # core, lifecycle, etc.) require compiling against 34+. Bumping
+          # a library's compileSdk higher is always safe, so just raise
+          # every plugin's to 36 unconditionally.
+          for f in $(find "$HOME/.pub-cache/hosted/pub.dev" -maxdepth 3 -name "build.gradle" 2>/dev/null); do
+            if grep -qE "compileSdkVersion [0-9]+" "$f"; then
+              echo "Bumping compileSdkVersion in $f"
+              sed -i -E 's/compileSdkVersion [0-9]+/compileSdkVersion 36/' "$f"
+            fi
+          done
+
+      - name: Strip legacy v1-embedding code from abandoned plugins
+        run: |
+          # nearby_connections' Java source still has a registerWith()
+          # method for Flutter's old "v1 embedding" system, which Flutter
+          # removed the Registrar class for entirely. flutter create has
+          # generated v2-embedding-only apps for years (this one
+          # included), so that method is never actually called - it's
+          # dead code that just needs to stop referencing a class that no
+          # longer exists. Strip it out with proper brace matching so
+          # nested code inside it doesn't break the removal.
+          python3 - <<'PYEOF'
+          import glob, os, re
+
+          pattern = os.path.expanduser(
+              "~/.pub-cache/hosted/pub.dev/nearby_connections-*/android/src/main/**/*.java"
+          )
+          for path in glob.glob(pattern, recursive=True):
+              with open(path, "r") as f:
+                  src = f.read()
+              if "PluginRegistry.Registrar" not in src:
+                  continue
+              original = src
+
+              src = re.sub(
+                  r"(?m)^import io\.flutter\.plugin\.common\.PluginRegistry\.Registrar;\n",
+                  "",
+                  src,
+              )
+              src = re.sub(
+                  r"(?m)^\s*private static PluginRegistry\.Registrar \w+;\n",
+                  "",
+                  src,
+              )
+
+              marker = re.search(r"public static void registerWith\(", src)
+              if marker:
+                  brace_start = src.find("{", marker.start())
+                  depth = 0
+                  i = brace_start
+                  while i < len(src):
+                      if src[i] == "{":
+                          depth += 1
+                      elif src[i] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              break
+                      i += 1
+                  src = src[: marker.start()] + src[i + 1 :]
+
+              # Any remaining "if (pluginRegistrar != null) { v1 path }
+              # else { v2 path }" is a dead v1/v2 branch now that the
+              # field is gone. The v1 "if" body is unreachable code to
+              # drop, but the "else" body is the real v2-embedding logic
+              # we need to KEEP - so unwrap it rather than deleting the
+              # whole if/else, falling back to a plain delete only when
+              # there's no else to preserve.
+              while True:
+                  guard = re.search(
+                      r"if\s*\(\s*pluginRegistrar\s*!=\s*null\s*\)\s*\{", src
+                  )
+                  if not guard:
+                      break
+
+                  if_brace_start = src.find("{", guard.start())
+                  depth = 0
+                  i = if_brace_start
+                  while i < len(src):
+                      if src[i] == "{":
+                          depth += 1
+                      elif src[i] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              break
+                      i += 1
+                  if_block_end = i + 1
+
+                  else_match = re.match(r"\s*else\s*\{", src[if_block_end:])
+                  if else_match:
+                      else_brace_start = if_block_end + src[
+                          if_block_end:
+                      ].index("{", else_match.start())
+                      depth = 0
+                      j = else_brace_start
+                      while j < len(src):
+                          if src[j] == "{":
+                              depth += 1
+                          elif src[j] == "}":
+                              depth -= 1
+                              if depth == 0:
+                                  break
+                          j += 1
+                      else_body = src[else_brace_start + 1 : j]
+                      src = (
+                          src[: guard.start()]
+                          + "{"
+                          + else_body
+                          + "}"
+                          + src[j + 1 :]
+                      )
+                  else:
+                      src = src[: guard.start()] + src[if_block_end:]
+
+              if src != original:
+                  with open(path, "w") as f:
+                      f.write(src)
+                  print(f"Stripped v1-embedding code from {path}")
+          PYEOF
+
+      - name: Build APK (release)
+        run: flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
